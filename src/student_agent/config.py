@@ -7,6 +7,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from .llm_client import LLMClient, LLMConfig
+
 TEAM_KEY_PATTERN = re.compile(r"^sk-team-[A-Za-z0-9_-]{16,128}$")
 
 
@@ -34,3 +36,19 @@ class Settings:
         if errors:
             raise ValueError("; ".join(errors))
         return cls(api_url, team_key, mcp_endpoint, resolved_root)
+
+
+def load_llm_client() -> LLMClient | None:
+    """Create an LLMClient from .env variables, or return None if not configured."""
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        return None
+    config = LLMConfig(
+        api_key=api_key,
+        base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip(),
+        model=os.getenv("OPENROUTER_MODEL", "qwen/qwen3-8b").strip(),
+        temperature=float(os.getenv("OPENROUTER_TEMPERATURE", "0")),
+        max_tokens=int(os.getenv("OPENROUTER_MAX_TOKENS", "2048")),
+    )
+    return LLMClient(config)
+

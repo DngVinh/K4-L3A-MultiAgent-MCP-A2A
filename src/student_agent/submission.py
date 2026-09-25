@@ -11,9 +11,18 @@ from . import OUTPUT_SCHEMA_VERSION, VARIANT_ID
 from .cases import CaseSet
 from .contracts import Contracts
 
-SECRET_PATTERN = re.compile(r"sk-team-[A-Za-z0-9_-]{8,}")
+SECRET_PATTERN = re.compile(r"(?:sk-team-|sk-or-v1-)[A-Za-z0-9_-]{8,}")
 MAX_FILE_BYTES = 1024 * 1024
 MAX_SUBMISSION_BYTES = 12 * 1024 * 1024
+LIFECYCLE_SEQUENCE = (
+    "case_received",
+    "task_assigned",
+    "tool_result_consumed",
+    "handoff",
+    "policy_decided",
+    "verification_completed",
+    "case_finalized",
+)
 
 
 def _json_object(path: Path) -> dict[str, Any]:
@@ -24,6 +33,18 @@ def _json_object(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{path}: expected a JSON object")
     return value
+
+
+def _required_workflow_events(root: Path) -> set[str]:
+    policy = _json_object(root / "contracts" / "scoring" / "scoring-policy-v2.json")
+    raw_events = policy.get("workflow_required_events")
+    if not isinstance(raw_events, list) or not all(
+        isinstance(event, str) for event in raw_events
+    ):
+        raise ValueError("scoring policy has invalid workflow_required_events")
+    required = set(raw_events)
+    required.update({"tool_result_consumed", "policy_decided"})
+    return required
 
 
 def build_manifest(case_set: CaseSet) -> dict[str, Any]:
@@ -65,6 +86,9 @@ def validate_artifacts(
         raise ValueError("traces/trace.jsonl is missing or not UTF-8") from exc
     normalized_lines: list[str] = []
     seen_events: set[str] = set()
+    events_by_case: dict[str, list[dict[str, Any]]] = {
+        case_id: [] for case_id in case_set.case_ids
+    }
     for number, line in enumerate(trace_lines, 1):
         if not line.strip():
             continue
@@ -78,7 +102,44 @@ def validate_artifacts(
         if event["event_id"] in seen_events:
             raise ValueError(f"traces/trace.jsonl:{number}: duplicate event_id")
         seen_events.add(event["event_id"])
+        events_by_case[event["case_id"]].append(event)
         normalized_lines.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+
+    required_events = _required_workflow_events(root)
+    for case_id in case_set.case_ids:
+        case_events = events_by_case[case_id]
+        event_types = {event["event_type"] for event in case_events}
+        missing_events = sorted(required_events - event_types)
+        if missing_events:
+            raise ValueError(f"trace for {case_id} is missing lifecycle events: {missing_events}")
+        first_index = {
+            event_type: next(
+                index
+                for index, event in enumerate(case_events)
+                if event["event_type"] == event_type
+            )
+            for event_type in LIFECYCLE_SEQUENCE
+        }
+        positions = [first_index[event_type] for event_type in LIFECYCLE_SEQUENCE]
+        if positions != sorted(positions) or len(set(positions)) != len(positions):
+            raise ValueError(
+                f"trace for {case_id} violates lifecycle order: {LIFECYCLE_SEQUENCE}"
+            )
+        consumed_refs: set[str] = set()
+        for event in case_events:
+            if event["event_type"] != "tool_result_consumed":
+                continue
+            if not event.get("tool_name") or not event.get("evidence_refs"):
+                raise ValueError(
+                    f"trace for {case_id} has an incomplete tool_result_consumed event"
+                )
+            consumed_refs.update(event["evidence_refs"])
+        output_refs = set(outputs[case_id]["evidence_refs"])
+        if not output_refs.issubset(consumed_refs):
+            missing_refs = sorted(output_refs - consumed_refs)
+            raise ValueError(
+                f"output for {case_id} cites refs not consumed in its trace: {missing_refs}"
+            )
 
     serialized = [json.dumps(value, ensure_ascii=False) for value in outputs.values()]
     if SECRET_PATTERN.search("\n".join([*serialized, *normalized_lines])):

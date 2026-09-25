@@ -16,22 +16,32 @@ class EvidenceGateway:
     def __init__(self, session: ClientSession, contracts: Contracts) -> None:
         self._session = session
         self._contracts = contracts
+        self._tool_names: tuple[str, ...] | None = None
 
     async def list_tools(self) -> list[str]:
+        if self._tool_names is not None:
+            return list(self._tool_names)
         response = await self._session.list_tools()
-        return sorted(tool.name for tool in response.tools)
+        self._tool_names = tuple(sorted(tool.name for tool in response.tools))
+        return list(self._tool_names)
 
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
+        available_tools = await self.list_tools()
+        if tool_name not in available_tools:
+            raise RuntimeError(f"MCP tool {tool_name} was not advertised by discovery")
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        # MCP 2.x uses snake_case Pydantic fields.  Keep the camelCase fallback for
+        # gateways/SDK adapters that expose the JSON wire names directly.
+        is_error = getattr(result, "is_error", getattr(result, "isError", False))
+        if is_error:
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
             raise RuntimeError(f"MCP tool {tool_name} failed: {message or 'unknown error'}")
-        evidence = getattr(result, "structuredContent", None)
+        evidence = getattr(result, "structured_content", None)
         if evidence is None:
-            evidence = getattr(result, "structured_content", None)
+            evidence = getattr(result, "structuredContent", None)
         if evidence is None:
             text_blocks = [block.text for block in result.content if getattr(block, "text", None)]
             if len(text_blocks) != 1:
